@@ -1,0 +1,163 @@
+name: Remote Android
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: read
+
+concurrency:
+group: remote-android
+cancel-in-progress: true
+
+jobs:
+android:
+runs-on: ubuntu-latest
+timeout-minutes: 3600
+
+env:
+  ANDROID_API: "35"
+
+steps:
+  - name: Install required packages
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y xvfb x11vnc fluxbox curl
+
+  - name: Enable Android emulator acceleration
+    run: |
+      echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+      sudo udevadm control --reload-rules
+      sudo udevadm trigger --name-match=kvm
+      ls -l /dev/kvm
+      test -e /dev/kvm
+
+  - name: Set up Android SDK
+    uses: android-actions/setup-android@v3
+
+  - name: Install Android emulator and system image
+    run: |
+      sdkmanager --install \
+        "platform-tools" \
+        "platforms;android-${ANDROID_API}" \
+        "emulator" \
+        "system-images;android-${ANDROID_API};google_apis;x86_64"
+
+      echo "no" | avdmanager create avd \
+        --name RemoteAndroid \
+        --package "system-images;android-${ANDROID_API};google_apis;x86_64" \
+        --device "pixel_2" \
+        --force
+
+  - name: Connect private Tailscale network
+    env:
+      TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+    run: |
+      test -n "$TS_AUTH_KEY" || {
+        echo "Missing TAILSCALE_AUTH_KEY secret"
+        exit 1
+      }
+
+      curl -fsSL https://tailscale.com/install.sh | sh
+      sudo tailscale up \
+        --authkey="$TS_AUTH_KEY" \
+        --hostname="android-${GITHUB_RUN_ID}" \
+        --accept-dns=false
+
+      TS_IP=$(sudo tailscale ip -4 | head -n 1)
+      test -n "$TS_IP"
+      echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+      echo "Android runner connected to private network."
+
+  - name: Start virtual desktop
+    run: |
+      Xvfb :99 -screen 0 1280x800x24 -ac &
+      sleep 3
+
+      DISPLAY=:99 fluxbox &
+      sleep 2
+
+  - name: Start Android emulator
+    run: |
+      nohup "$ANDROID_HOME/emulator/emulator" \
+        -avd RemoteAndroid \
+        -gpu swiftshader_indirect \
+        -no-audio \
+        -no-boot-anim \
+        -no-snapshot \
+        > /tmp/android-emulator.log 2>&1 &
+
+      for i in $(seq 1 120); do
+        if adb devices | grep -q 'emulator-5554'; then
+          break
+        fi
+        sleep 5
+      done
+
+      adb devices
+      adb -s emulator-5554 wait-for-device
+
+      for i in $(seq 1 120); do
+        BOOT=$(adb -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+        if [ "$BOOT" = "1" ]; then
+          break
+        fi
+        sleep 5
+      done
+
+      test "$BOOT" = "1" || {
+        tail -n 100 /tmp/android-emulator.log
+        exit 1
+      }
+
+      adb -s emulator-5554 shell input keyevent 82
+      adb -s emulator-5554 shell wm size 720x1280
+      adb -s emulator-5554 shell wm density 240
+
+  - name: Start password-protected remote desktop
+    env:
+      VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+    run: |
+      test -n "$VNC_PASSWORD" || {
+        echo "Missing VNC_PASSWORD secret"
+        exit 1
+      }
+
+      install -d -m 700 "$HOME/.vnc"
+      x11vnc -storepasswd "$VNC_PASSWORD" "$HOME/.vnc/passwd"
+      chmod 600 "$HOME/.vnc/passwd"
+
+      nohup x11vnc \
+        -display :99 \
+        -forever \
+        -shared \
+        -rfbauth "$HOME/.vnc/passwd" \
+        -rfbport 5900 \
+        -listen "$TAILSCALE_IP" \
+        -noxdamage \
+        > /tmp/x11vnc.log 2>&1 &
+
+      for i in $(seq 1 20); do
+        if ss -lnt | grep -q ':5900'; then
+          break
+        fi
+        sleep 1
+      done
+
+      ss -lnt | grep ':5900'
+
+  - name: Display connection information
+    run: |
+      echo "===================================="
+      echo "REMOTE ANDROID IS RUNNING"
+      echo "VNC Address: $TAILSCALE_IP:5900"
+      echo "Username: leave blank if requested"
+      echo "Password: use your VNC_PASSWORD secret"
+      echo "===================================="
+
+  - name: Keep Android running
+    run: |
+      while true; do
+        adb -s emulator-5554 get-state
+        sleep 60
+      done
